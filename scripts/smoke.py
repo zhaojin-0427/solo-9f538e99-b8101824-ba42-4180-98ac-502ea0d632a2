@@ -129,6 +129,66 @@ def main() -> int:
                  params={"station": "NOPE", "minute_utc": MIN})
     check("unknown publication 404", r.status_code == 404)
 
+    # 13. Traceability: event ledger, sequenced reconstruction, expiry cause.
+    ledger = http.get("/trace/events",
+                      params={"station": ST, "minute_utc": MIN}).json()["events"]
+    check("trace ledger records additions, publish and correction",
+          [e["kind"] for e in ledger]
+          == ["fragment_added", "fragment_added", "publish",
+              "fragment_revised", "publish"],
+          f"kinds={[e['kind'] for e in ledger]}")
+    seqs = [e["seq"] for e in ledger]
+    check("trace sequences strictly increase", seqs == sorted(set(seqs)))
+
+    at_first = http.get("/trace", params={"station": ST, "minute_utc": MIN,
+                                          "seq": seqs[0]}).json()
+    check("trace reconstructs the moment of the first fragment",
+          at_first["resolved_seq"] == seqs[0]
+          and [f["fragment_no"] for f in at_first["fragments"]] == [2]
+          and at_first["assembly"]["gaps"] == list(range(0, 30)),
+          f"frags={[f['fragment_no'] for f in at_first['fragments']]}")
+
+    conflict_ev = next((e for e in ledger if e["kind"] == "fragment_revised"), None)
+    if conflict_ev is not None:
+        hist = http.get("/trace", params={"station": ST, "minute_utc": MIN,
+                                         "seq": conflict_ev["seq"]}).json()
+        check("trace resolves a historical revision, not the current one",
+              any(f["fragment_no"] == conflict_ev["fragment_no"]
+                  and f["revision"] == conflict_ev["revision"]
+                  for f in hist["fragments"]),
+              f"seq={conflict_ev['seq']}")
+        check("trace lists the publications that change expired",
+              [p["id"] for p in hist["expired_publications"]] == [pub1["id"]]
+              and hist["expired_publications"][0]["invalidated_by_seq"]
+              == conflict_ev["seq"])
+
+    latest_seq = seqs[-1]  # the publish event of the corrected fragment set
+    at_pub = http.get("/trace", params={"station": ST, "minute_utc": MIN,
+                                        "seq": latest_seq}).json()
+    check("trace shows a publication fresh at its own sequence",
+          [p["id"] for p in at_pub["publications"]] == [pub2["id"]]
+          and at_pub["publications"][0]["fresh"] is True
+          and at_pub["publications"][0]["creation_time_known"] is True)
+
+    by_no = http.get("/trace", params={"station": ST, "minute_utc": MIN,
+                                       "fragment_no": 1}).json()
+    check("trace by fragment_no locates its latest accepted change",
+          by_no["event"]["fragment_no"] == 1
+          and by_no["event"]["revision"] == 2)
+
+    # An unknown minute has no trace history.
+    r = http.get("/trace", params={"station": "NOPE", "minute_utc": MIN})
+    check("trace of unknown minute 404", r.status_code == 404)
+
+    # Idempotent retry after everything: no new trace event.
+    before_n = len(ledger)
+    http.post("/fragments", json=frag(2, 1, 30, list(range(30, 60))))
+    after_n = len(http.get("/trace/events",
+                           params={"station": ST, "minute_utc": MIN})
+                  .json()["events"])
+    check("idempotent retry adds no trace event", after_n == before_n,
+          f"{before_n} -> {after_n}")
+
     print()
     if failures:
         print(f"{len(failures)} FAILURE(S): {failures}")
